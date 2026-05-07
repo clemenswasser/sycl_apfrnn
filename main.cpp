@@ -1,4 +1,3 @@
-#include <chrono>
 #include <iostream>
 #include <oneapi/dpl/algorithm>
 #include <oneapi/dpl/execution>
@@ -8,22 +7,15 @@
 
 using namespace sycl;
 
-inline uint64_t expand_bits(uint32_t v) {
-  uint64_t x = v & 0x1fffff;
-  x = (x | x << 32) & 0x1f00000000ffffULL;
-  x = (x | x << 16) & 0x1f0000ff0000ffULL;
-  x = (x | x << 8) & 0x100f00f00f00f00fULL;
-  x = (x | x << 4) & 0x10c30c30c30c30c3ULL;
-  x = (x | x << 2) & 0x1249249249249249ULL;
-  return x;
-}
+const int TABLE_BITS = 22;
+const uint32_t TABLE_SIZE = 1u << TABLE_BITS;
+const uint32_t TABLE_MASK = TABLE_SIZE - 1;
 
-inline int lower_bound_p2(const uint64_t *arr, int power_of_2, uint64_t key) {
-  int left = 0;
-  for (int step = power_of_2 >> 1; step > 0; step >>= 1) {
-    left += (arr[left + step] < key) ? step : 0;
-  }
-  return left + (arr[left] < key ? 1 : 0);
+inline uint32_t get_hash(uint32_t cx, uint32_t cy, uint32_t cz) {
+  const uint32_t p1 = 73856093;
+  const uint32_t p2 = 19349663;
+  const uint32_t p3 = 83492791;
+  return (cx * p1 ^ cy * p2 ^ cz * p3) & TABLE_MASK;
 }
 
 double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
@@ -34,20 +26,19 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
     std::cout << "--- GPU Pipeline Starting (" << N << " particles) ---\n";
   }
 
-  int power_of_2 = 1;
-  while (power_of_2 < N) {
-    power_of_2 <<= 1;
-  }
-
   sycl::float3 *d_pos = malloc_device<sycl::float3>(N, q);
-  uint64_t *d_keys = malloc_device<uint64_t>(power_of_2 + 1, q);
+  uint32_t *d_keys = malloc_device<uint32_t>(N, q);
   uint32_t *d_values = malloc_device<uint32_t>(N, q);
   sycl::float3 *d_sorted_pos = malloc_device<sycl::float3>(N, q);
 
   int *d_counts = malloc_device<int>(N + 1, q);
   int *d_offsets = malloc_device<int>(N + 1, q);
+  uint32_t *d_cell_start = malloc_device<uint32_t>(TABLE_SIZE, q);
+  uint32_t *d_cell_end = malloc_device<uint32_t>(TABLE_SIZE, q);
 
-  q.fill(d_counts, 0, N + 1).wait();
+  q.fill(d_counts, 0, N + 1);
+  q.fill(d_cell_start, 0, TABLE_SIZE);
+  q.fill(d_cell_end, 0, TABLE_SIZE);
   q.memcpy(d_pos, h_pos.data(), N * sizeof(sycl::float3)).wait();
 
   const float WORLD_OFFSET = 10000.0f;
@@ -67,12 +58,12 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
           return;
 
         sycl::float3 p = d_pos[idx];
+
         uint32_t cx = (uint32_t)((p.x() + WORLD_OFFSET) * inv_radius);
         uint32_t cy = (uint32_t)((p.y() + WORLD_OFFSET) * inv_radius);
         uint32_t cz = (uint32_t)((p.z() + WORLD_OFFSET) * inv_radius);
 
-        d_keys[idx] =
-            expand_bits(cx) | (expand_bits(cy) << 1) | (expand_bits(cz) << 2);
+        d_keys[idx] = get_hash(cx, cy, cz);
         d_values[idx] = idx;
       });
   evt.wait();
@@ -83,7 +74,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
       evt.get_profiling_info<sycl::info::event_profiling::command_end>();
   double true_gpu_time_ms = (end_ns - start_ns) / 1e6;
   if (print)
-    std::cout << "1. Morton Codes Gen:   " << true_gpu_time_ms << " ms\n";
+    std::cout << "1. Hash Codes Gen:     " << true_gpu_time_ms << " ms\n";
 
   auto policy = oneapi::dpl::execution::make_device_policy(q);
   sycl::event start_evt =
@@ -94,8 +85,6 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   sycl::event end_evt =
       q.submit([&](sycl::handler &h) { h.single_task<>([]() {}); });
   end_evt.wait();
-
-  q.fill(d_keys + N, 0xffffffffffffffffULL, (power_of_2 + 1) - N).wait();
 
   start_ns =
       start_evt
@@ -109,8 +98,23 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   evt = q.parallel_for(nd_range<1>(range<1>(global_size), range<1>(local_size)),
                        [=](nd_item<1> item) {
                          int idx = item.get_global_id(0);
-                         if (idx < N) {
-                           d_sorted_pos[idx] = d_pos[d_values[idx]];
+                         if (idx >= N)
+                           return;
+
+                         d_sorted_pos[idx] = d_pos[d_values[idx]];
+
+                         uint32_t hash = d_keys[idx];
+                         if (idx == 0) {
+                           d_cell_start[hash] = 0;
+                         } else {
+                           uint32_t prev_hash = d_keys[idx - 1];
+                           if (hash != prev_hash) {
+                             d_cell_start[hash] = idx;
+                             d_cell_end[prev_hash] = idx;
+                           }
+                         }
+                         if (idx == N - 1) {
+                           d_cell_end[hash] = N;
                          }
                        });
   evt.wait();
@@ -119,7 +123,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   end_ns = evt.get_profiling_info<sycl::info::event_profiling::command_end>();
   true_gpu_time_ms = (end_ns - start_ns) / 1e6;
   if (print)
-    std::cout << "3. Position Reorder:   " << true_gpu_time_ms << " ms\n";
+    std::cout << "3. Pos Reorder & Spans: " << true_gpu_time_ms << " ms\n";
 
   evt = q.parallel_for(
       nd_range<1>(range<1>(global_size), range<1>(local_size)),
@@ -135,31 +139,19 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
         uint32_t cz = (uint32_t)((my_pos.z() + WORLD_OFFSET) * inv_radius);
 
         int neighbor_count = 0;
-        uint64_t ex_x[3], ex_y[3], ex_z[3];
-#pragma unroll
-        for (int i = 0; i < 3; ++i) {
-          ex_x[i] = expand_bits(cx + i - 1);
-          ex_y[i] = expand_bits(cy + i - 1) << 1;
-          ex_z[i] = expand_bits(cz + i - 1) << 2;
-        }
 
 #pragma unroll
-        for (int z = 0; z < 3; ++z) {
+        for (int dz = -1; dz <= 1; ++dz) {
 #pragma unroll
-          for (int y = 0; y < 3; ++y) {
+          for (int dy = -1; dy <= 1; ++dy) {
 #pragma unroll
-            for (int x = 0; x < 3; ++x) {
+            for (int dx = -1; dx <= 1; ++dx) {
 
-              uint64_t neighbor_code = ex_x[x] | ex_y[y] | ex_z[z];
+              uint32_t neighbor_hash = get_hash(cx + dx, cy + dy, cz + dz);
+              uint32_t start = d_cell_start[neighbor_hash];
+              uint32_t end = d_cell_end[neighbor_hash];
 
-              int start = lower_bound_p2(d_keys, power_of_2, neighbor_code);
-              int end = start;
-
-              while (d_keys[end] == neighbor_code) {
-                end++;
-              }
-
-              for (int j = start; j < end; ++j) {
+              for (uint32_t j = start; j < end; ++j) {
                 if (idx == j)
                   continue;
 
@@ -227,31 +219,19 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
         int write_offset = d_offsets[original_idx];
         int local_neighbor_count = 0;
 
-        uint64_t ex_x[3], ex_y[3], ex_z[3];
 #pragma unroll
-        for (int i = 0; i < 3; ++i) {
-          ex_x[i] = expand_bits(cx + i - 1);
-          ex_y[i] = expand_bits(cy + i - 1) << 1;
-          ex_z[i] = expand_bits(cz + i - 1) << 2;
-        }
-
+        for (int dz = -1; dz <= 1; ++dz) {
 #pragma unroll
-        for (int z = 0; z < 3; ++z) {
+          for (int dy = -1; dy <= 1; ++dy) {
 #pragma unroll
-          for (int y = 0; y < 3; ++y) {
-#pragma unroll
-            for (int x = 0; x < 3; ++x) {
+            for (int dx = -1; dx <= 1; ++dx) {
 
-              uint64_t neighbor_code = ex_x[x] | ex_y[y] | ex_z[z];
+              uint32_t neighbor_hash = get_hash(cx + dx, cy + dy, cz + dz);
 
-              int start = lower_bound_p2(d_keys, power_of_2, neighbor_code);
-              int end = start;
+              uint32_t start = d_cell_start[neighbor_hash];
+              uint32_t end = d_cell_end[neighbor_hash];
 
-              while (d_keys[end] == neighbor_code) {
-                end++;
-              }
-
-              for (int j = start; j < end; ++j) {
+              for (uint32_t j = start; j < end; ++j) {
                 if (idx == j)
                   continue;
 
@@ -325,6 +305,8 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   free(d_sorted_pos, q);
   free(d_counts, q);
   free(d_offsets, q);
+  free(d_cell_start, q);
+  free(d_cell_end, q);
   if (d_neighbors)
     free(d_neighbors, q);
 
