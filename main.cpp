@@ -24,19 +24,20 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
     std::cout << "--- GPU Pipeline Starting (" << N << " particles) ---\n";
   }
 
-  const uint32_t TABLE_BITS = 21;
+  const uint32_t TABLE_BITS = 18;
   const uint32_t TABLE_SIZE = 1u << TABLE_BITS;
   const uint32_t TABLE_MASK = TABLE_SIZE - 1;
+
   sycl::float4 *d_pos = malloc_device<sycl::float4>(N, q);
   sycl::float4 *d_sorted_pos = malloc_device<sycl::float4>(N, q);
   uint32_t *d_keys = malloc_device<uint32_t>(N, q);
   uint32_t *d_values = malloc_device<uint32_t>(N, q);
   int *d_counts = malloc_device<int>(N + 1, q);
   int *d_offsets = malloc_device<int>(N + 1, q);
-  uint64_t *d_cell_bounds = malloc_device<uint64_t>(TABLE_SIZE, q);
+  sycl::uint2 *d_cell_bounds = malloc_device<sycl::uint2>(TABLE_SIZE, q);
 
   q.fill(d_counts, 0, N + 1);
-  q.fill(d_cell_bounds, 0ULL, TABLE_SIZE);
+  q.fill(d_cell_bounds, sycl::uint2(0, 0), TABLE_SIZE);
   q.memcpy(d_pos, h_pos.data(), N * sizeof(sycl::float3)).wait();
 
   const float WORLD_OFFSET = 10.0f;
@@ -50,7 +51,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
 
   auto evt = q.parallel_for(
       nd_range<1>(range<1>(global_size), range<1>(local_size)),
-      [=](nd_item<1> item) {
+      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
         int idx = item.get_global_id(0);
         if (idx >= N)
           return;
@@ -83,7 +84,6 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   sycl::event end_evt =
       q.submit([&](sycl::handler &h) { h.single_task<>([]() {}); });
   end_evt.wait();
-
   start_ns =
       start_evt
           .get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -94,9 +94,8 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
     std::cout << "2. Hardware Radix Sort: " << true_gpu_time_ms << " ms\n";
 
   uint32_t *d_cell_bounds_32 = reinterpret_cast<uint32_t *>(d_cell_bounds);
-
   evt = q.parallel_for(nd_range<1>(range<1>(global_size), range<1>(local_size)),
-                       [=](nd_item<1> item) {
+                       [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
                          int idx = item.get_global_id(0);
                          if (idx >= N)
                            return;
@@ -116,9 +115,8 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
                              d_cell_bounds_32[prev_hash * 2 + 1] = idx;
                            }
                          }
-                         if (idx == N - 1) {
+                         if (idx == N - 1)
                            d_cell_bounds_32[hash * 2 + 1] = N;
-                         }
                        });
   evt.wait();
   start_ns =
@@ -130,7 +128,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
 
   evt = q.parallel_for(
       nd_range<1>(range<1>(global_size), range<1>(local_size)),
-      [=](nd_item<1> item) {
+      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
         int idx = item.get_global_id(0);
         if (idx >= N)
           return;
@@ -139,7 +137,8 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
         uint32_t cx = (uint32_t)((my_pos.x() + WORLD_OFFSET) * inv_radius);
         uint32_t cy = (uint32_t)((my_pos.y() + WORLD_OFFSET) * inv_radius);
         uint32_t cz = (uint32_t)((my_pos.z() + WORLD_OFFSET) * inv_radius);
-        int neighbor_count = 0;
+        int neighbor_count = -1;
+
         uint32_t cx_m[3], cy_m[3], cz_m[3];
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
@@ -148,34 +147,28 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
           cz_m[i] = expand_bits(cz + i - 1) << 2;
         }
 
-#pragma unroll 1
+#pragma unroll
         for (int z = 0; z < 3; ++z) {
-#pragma unroll 1
+#pragma unroll
           for (int y = 0; y < 3; ++y) {
-#pragma unroll 1
+#pragma unroll
             for (int x = 0; x < 3; ++x) {
               uint32_t neighbor_hash =
                   (cx_m[x] | cy_m[y] | cz_m[z]) & TABLE_MASK;
 
-              uint64_t bounds = d_cell_bounds[neighbor_hash];
-              uint32_t start = (uint32_t)(bounds & 0xFFFFFFFF);
-              uint32_t end = (uint32_t)(bounds >> 32);
-
+              sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
+              uint32_t start = bounds.x();
+              uint32_t end = bounds.y();
+              int local_count = 0;
               for (uint32_t j = start; j < end; ++j) {
-                if (idx == j)
-                  continue;
-
                 sycl::float4 n_pos = d_sorted_pos[j];
                 float dx = my_pos.x() - n_pos.x();
                 float dy = my_pos.y() - n_pos.y();
                 float dz = my_pos.z() - n_pos.z();
-
-                float dist2 = dx * dx + dy * dy + dz * dz;
-
-                if (dist2 <= radius2) {
-                  neighbor_count++;
-                }
+                float dist2 = sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
+                local_count += (dist2 <= radius2) ? 1 : 0; // Branchless!
               }
+              neighbor_count += local_count;
             }
           }
         }
@@ -208,13 +201,12 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   q.memcpy(&total_neighbors, d_offsets + N, sizeof(int)).wait();
 
   int *d_neighbors = nullptr;
-  if (total_neighbors > 0) {
+  if (total_neighbors > 0)
     d_neighbors = malloc_device<int>(total_neighbors, q);
-  }
 
   evt = q.parallel_for(
       nd_range<1>(range<1>(global_size), range<1>(local_size)),
-      [=](nd_item<1> item) {
+      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
         int idx = item.get_global_id(0);
         if (idx >= N)
           return;
@@ -226,6 +218,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
         int original_idx = sycl::bit_cast<int>(my_pos.w());
         int write_offset = d_offsets[original_idx];
         int local_neighbor_count = 0;
+
         uint32_t cx_m[3], cy_m[3], cz_m[3];
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
@@ -234,35 +227,31 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
           cz_m[i] = expand_bits(cz + i - 1) << 2;
         }
 
-#pragma unroll 1
+#pragma unroll
         for (int z = 0; z < 3; ++z) {
-#pragma unroll 1
+#pragma unroll
           for (int y = 0; y < 3; ++y) {
-#pragma unroll 1
+#pragma unroll
             for (int x = 0; x < 3; ++x) {
               uint32_t neighbor_hash =
                   (cx_m[x] | cy_m[y] | cz_m[z]) & TABLE_MASK;
 
-              uint64_t bounds = d_cell_bounds[neighbor_hash];
-              uint32_t start = (uint32_t)(bounds & 0xFFFFFFFF);
-              uint32_t end = (uint32_t)(bounds >> 32);
+              sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
+              uint32_t start = bounds.x();
+              uint32_t end = bounds.y();
 
               for (uint32_t j = start; j < end; ++j) {
-                if (idx == j)
-                  continue;
-
                 sycl::float4 n_pos = d_sorted_pos[j];
                 float dx = my_pos.x() - n_pos.x();
                 float dy = my_pos.y() - n_pos.y();
                 float dz = my_pos.z() - n_pos.z();
-
-                float dist2 = dx * dx + dy * dy + dz * dz;
-
-                if (dist2 <= radius2) {
+                float dist2 = sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
+                bool is_neigh = (dist2 <= radius2) && (idx != j);
+                if (is_neigh) {
                   d_neighbors[write_offset + local_neighbor_count] =
                       sycl::bit_cast<int>(n_pos.w());
-                  local_neighbor_count++;
                 }
+                local_neighbor_count += is_neigh ? 1 : 0;
               }
             }
           }
