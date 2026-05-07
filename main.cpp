@@ -43,7 +43,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   const float WORLD_OFFSET = 10.0f;
   const float inv_radius = 1.0f / radius;
   const float radius2 = radius * radius;
-  size_t local_size = 256;
+  size_t local_size = 1024;
   size_t global_size = ((N + local_size - 1) / local_size) * local_size;
 
   sycl::event global_start_evt =
@@ -51,7 +51,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
 
   auto evt = q.parallel_for(
       nd_range<1>(range<1>(global_size), range<1>(local_size)),
-      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
         int idx = item.get_global_id(0);
         if (idx >= N)
           return;
@@ -95,7 +95,7 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
 
   uint32_t *d_cell_bounds_32 = reinterpret_cast<uint32_t *>(d_cell_bounds);
   evt = q.parallel_for(nd_range<1>(range<1>(global_size), range<1>(local_size)),
-                       [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                       [=](nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                          int idx = item.get_global_id(0);
                          if (idx >= N)
                            return;
@@ -126,56 +126,119 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   if (print)
     std::cout << "3. Pos Reorder & Spans: " << true_gpu_time_ms << " ms\n";
 
-  evt = q.parallel_for(
-      nd_range<1>(range<1>(global_size), range<1>(local_size)),
-      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-        int idx = item.get_global_id(0);
-        if (idx >= N)
-          return;
+  evt = q.submit([&](sycl::handler &h) {
+    sycl::local_accessor<sycl::float4, 1> slm_pos(sycl::range<1>(local_size),
+                                                  h);
+    h.parallel_for(
+        nd_range<1>(range<1>(global_size), range<1>(local_size)),
+        [=](nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+          int idx = item.get_global_id(0);
 
-        sycl::float4 my_pos = d_sorted_pos[idx];
-        uint32_t cx = (uint32_t)((my_pos.x() + WORLD_OFFSET) * inv_radius);
-        uint32_t cy = (uint32_t)((my_pos.y() + WORLD_OFFSET) * inv_radius);
-        uint32_t cz = (uint32_t)((my_pos.z() + WORLD_OFFSET) * inv_radius);
-        int neighbor_count = -1;
+          auto sg = item.get_sub_group();
+          uint32_t sg_local_id = sg.get_local_id()[0];
+          uint32_t sg_size = sg.get_local_linear_range();
+          uint32_t sg_id = item.get_local_id(0) / sg_size;
+          uint32_t slm_offset = sg_id * sg_size;
 
-        uint32_t cx_m[3], cy_m[3], cz_m[3];
-#pragma unroll
-        for (int i = 0; i < 3; ++i) {
-          cx_m[i] = expand_bits(cx + i - 1);
-          cy_m[i] = expand_bits(cy + i - 1) << 1;
-          cz_m[i] = expand_bits(cz + i - 1) << 2;
-        }
+          sycl::float4 my_pos = (idx < N) ? d_sorted_pos[idx] : sycl::float4(0);
+          uint32_t my_hash = (idx < N) ? d_keys[idx] : 0;
 
-#pragma unroll
-        for (int z = 0; z < 3; ++z) {
-#pragma unroll
-          for (int y = 0; y < 3; ++y) {
-#pragma unroll
-            for (int x = 0; x < 3; ++x) {
-              uint32_t neighbor_hash =
-                  (cx_m[x] | cy_m[y] | cz_m[z]) & TABLE_MASK;
+          uint32_t sg_hash = sycl::group_broadcast(sg, my_hash, 0);
+          if (idx >= N) {
+            my_hash = sg_hash;
+          }
+          bool uniform_cell = sycl::all_of_group(sg, my_hash == sg_hash);
 
-              sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
-              uint32_t start = bounds.x();
-              uint32_t end = bounds.y();
-              int local_count = 0;
-              for (uint32_t j = start; j < end; ++j) {
-                sycl::float4 n_pos = d_sorted_pos[j];
-                float dx = my_pos.x() - n_pos.x();
-                float dy = my_pos.y() - n_pos.y();
-                float dz = my_pos.z() - n_pos.z();
-                float dist2 = sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
-                local_count += (dist2 <= radius2) ? 1 : 0; // Branchless!
+          uint32_t cx = 0, cy = 0, cz = 0;
+          int neighbor_count = -1;
+
+          if (idx < N) {
+            cx = (uint32_t)((my_pos.x() + WORLD_OFFSET) * inv_radius);
+            cy = (uint32_t)((my_pos.y() + WORLD_OFFSET) * inv_radius);
+            cz = (uint32_t)((my_pos.z() + WORLD_OFFSET) * inv_radius);
+          }
+
+          if (uniform_cell) {
+            uint32_t uniform_cx = sycl::group_broadcast(sg, cx, 0);
+            uint32_t uniform_cy = sycl::group_broadcast(sg, cy, 0);
+            uint32_t uniform_cz = sycl::group_broadcast(sg, cz, 0);
+
+            for (int z = -1; z <= 1; ++z) {
+              for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                  uint32_t neighbor_hash =
+                      (expand_bits(uniform_cx + x) |
+                       (expand_bits(uniform_cy + y) << 1) |
+                       (expand_bits(uniform_cz + z) << 2)) &
+                      TABLE_MASK;
+
+                  sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
+                  uint32_t start = bounds.x();
+                  uint32_t end = bounds.y();
+
+                  for (uint32_t j = start; j < end; j += sg_size) {
+                    uint32_t load_idx = j + sg_local_id;
+                    if (load_idx < end) {
+                      slm_pos[slm_offset + sg_local_id] =
+                          d_sorted_pos[load_idx];
+                    }
+                    sycl::group_barrier(sg);
+
+                    uint32_t tile_size = sycl::min((uint32_t)sg_size, end - j);
+                    int local_count = 0;
+                    if (idx < N) {
+                      for (uint32_t k = 0; k < tile_size; ++k) {
+                        sycl::float4 n_pos = slm_pos[slm_offset + k];
+                        float dx = my_pos.x() - n_pos.x();
+                        float dy = my_pos.y() - n_pos.y();
+                        float dz = my_pos.z() - n_pos.z();
+                        float dist2 =
+                            sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
+                        local_count += (dist2 <= radius2) ? 1 : 0;
+                      }
+                    }
+                    neighbor_count += local_count;
+                    sycl::group_barrier(sg);
+                  }
+                }
               }
-              neighbor_count += local_count;
+            }
+          } else {
+            if (idx < N) {
+              for (int z = -1; z <= 1; ++z) {
+                for (int y = -1; y <= 1; ++y) {
+                  for (int x = -1; x <= 1; ++x) {
+                    uint32_t neighbor_hash =
+                        (expand_bits(cx + x) | (expand_bits(cy + y) << 1) |
+                         (expand_bits(cz + z) << 2)) &
+                        TABLE_MASK;
+
+                    sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
+                    uint32_t start = bounds.x();
+                    uint32_t end = bounds.y();
+                    int local_count = 0;
+                    for (uint32_t j = start; j < end; ++j) {
+                      sycl::float4 n_pos = d_sorted_pos[j];
+                      float dx = my_pos.x() - n_pos.x();
+                      float dy = my_pos.y() - n_pos.y();
+                      float dz = my_pos.z() - n_pos.z();
+                      float dist2 =
+                          sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
+                      local_count += (dist2 <= radius2) ? 1 : 0;
+                    }
+                    neighbor_count += local_count;
+                  }
+                }
+              }
             }
           }
-        }
 
-        int original_idx = sycl::bit_cast<int>(my_pos.w());
-        d_counts[original_idx] = neighbor_count;
-      });
+          if (idx < N) {
+            int original_idx = sycl::bit_cast<int>(my_pos.w());
+            d_counts[original_idx] = neighbor_count;
+          }
+        });
+  });
   evt.wait();
   start_ns =
       evt.get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -204,59 +267,125 @@ double run_gpu_neighbor_search(queue &q, const std::vector<sycl::float3> &h_pos,
   if (total_neighbors > 0)
     d_neighbors = malloc_device<int>(total_neighbors, q);
 
-  evt = q.parallel_for(
-      nd_range<1>(range<1>(global_size), range<1>(local_size)),
-      [=](nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-        int idx = item.get_global_id(0);
-        if (idx >= N)
-          return;
+  evt = q.submit([&](sycl::handler &h) {
+    sycl::local_accessor<sycl::float4, 1> slm_pos(sycl::range<1>(local_size),
+                                                  h);
+    h.parallel_for(
+        nd_range<1>(range<1>(global_size), range<1>(local_size)),
+        [=](nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+          int idx = item.get_global_id(0);
 
-        sycl::float4 my_pos = d_sorted_pos[idx];
-        uint32_t cx = (uint32_t)((my_pos.x() + WORLD_OFFSET) * inv_radius);
-        uint32_t cy = (uint32_t)((my_pos.y() + WORLD_OFFSET) * inv_radius);
-        uint32_t cz = (uint32_t)((my_pos.z() + WORLD_OFFSET) * inv_radius);
-        int original_idx = sycl::bit_cast<int>(my_pos.w());
-        int write_offset = d_offsets[original_idx];
-        int local_neighbor_count = 0;
+          auto sg = item.get_sub_group();
+          uint32_t sg_local_id = sg.get_local_id()[0];
+          uint32_t sg_size = sg.get_local_linear_range();
+          uint32_t sg_id = item.get_local_id(0) / sg_size;
+          uint32_t slm_offset = sg_id * sg_size;
 
-        uint32_t cx_m[3], cy_m[3], cz_m[3];
-#pragma unroll
-        for (int i = 0; i < 3; ++i) {
-          cx_m[i] = expand_bits(cx + i - 1);
-          cy_m[i] = expand_bits(cy + i - 1) << 1;
-          cz_m[i] = expand_bits(cz + i - 1) << 2;
-        }
+          sycl::float4 my_pos = (idx < N) ? d_sorted_pos[idx] : sycl::float4(0);
+          uint32_t my_hash = (idx < N) ? d_keys[idx] : 0;
 
-#pragma unroll
-        for (int z = 0; z < 3; ++z) {
-#pragma unroll
-          for (int y = 0; y < 3; ++y) {
-#pragma unroll
-            for (int x = 0; x < 3; ++x) {
-              uint32_t neighbor_hash =
-                  (cx_m[x] | cy_m[y] | cz_m[z]) & TABLE_MASK;
+          uint32_t sg_hash = sycl::group_broadcast(sg, my_hash, 0);
+          if (idx >= N) {
+            my_hash = sg_hash;
+          }
+          bool uniform_cell = sycl::all_of_group(sg, my_hash == sg_hash);
 
-              sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
-              uint32_t start = bounds.x();
-              uint32_t end = bounds.y();
+          uint32_t cx = 0, cy = 0, cz = 0;
+          int original_idx = 0;
+          int write_offset = 0;
+          int local_neighbor_count = 0;
 
-              for (uint32_t j = start; j < end; ++j) {
-                sycl::float4 n_pos = d_sorted_pos[j];
-                float dx = my_pos.x() - n_pos.x();
-                float dy = my_pos.y() - n_pos.y();
-                float dz = my_pos.z() - n_pos.z();
-                float dist2 = sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
-                bool is_neigh = (dist2 <= radius2) && (idx != j);
-                if (is_neigh) {
-                  d_neighbors[write_offset + local_neighbor_count] =
-                      sycl::bit_cast<int>(n_pos.w());
+          if (idx < N) {
+            cx = (uint32_t)((my_pos.x() + WORLD_OFFSET) * inv_radius);
+            cy = (uint32_t)((my_pos.y() + WORLD_OFFSET) * inv_radius);
+            cz = (uint32_t)((my_pos.z() + WORLD_OFFSET) * inv_radius);
+            original_idx = sycl::bit_cast<int>(my_pos.w());
+            write_offset = d_offsets[original_idx];
+          }
+
+          if (uniform_cell) {
+            uint32_t uniform_cx = sycl::group_broadcast(sg, cx, 0);
+            uint32_t uniform_cy = sycl::group_broadcast(sg, cy, 0);
+            uint32_t uniform_cz = sycl::group_broadcast(sg, cz, 0);
+
+            for (int z = -1; z <= 1; ++z) {
+              for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                  uint32_t neighbor_hash =
+                      (expand_bits(uniform_cx + x) |
+                       (expand_bits(uniform_cy + y) << 1) |
+                       (expand_bits(uniform_cz + z) << 2)) &
+                      TABLE_MASK;
+
+                  sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
+                  uint32_t start = bounds.x();
+                  uint32_t end = bounds.y();
+
+                  for (uint32_t j = start; j < end; j += sg_size) {
+                    uint32_t load_idx = j + sg_local_id;
+                    if (load_idx < end) {
+                      slm_pos[slm_offset + sg_local_id] =
+                          d_sorted_pos[load_idx];
+                    }
+                    sycl::group_barrier(sg);
+
+                    uint32_t tile_size = sycl::min((uint32_t)sg_size, end - j);
+                    if (idx < N) {
+                      for (uint32_t k = 0; k < tile_size; ++k) {
+                        sycl::float4 n_pos = slm_pos[slm_offset + k];
+                        float dx = my_pos.x() - n_pos.x();
+                        float dy = my_pos.y() - n_pos.y();
+                        float dz = my_pos.z() - n_pos.z();
+                        float dist2 =
+                            sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
+                        bool is_neigh = (dist2 <= radius2) && (idx != (j + k));
+                        if (is_neigh) {
+                          d_neighbors[write_offset + local_neighbor_count] =
+                              sycl::bit_cast<int>(n_pos.w());
+                          local_neighbor_count++;
+                        }
+                      }
+                    }
+                    sycl::group_barrier(sg);
+                  }
                 }
-                local_neighbor_count += is_neigh ? 1 : 0;
+              }
+            }
+          } else {
+            if (idx < N) {
+              for (int z = -1; z <= 1; ++z) {
+                for (int y = -1; y <= 1; ++y) {
+                  for (int x = -1; x <= 1; ++x) {
+                    uint32_t neighbor_hash =
+                        (expand_bits(cx + x) | (expand_bits(cy + y) << 1) |
+                         (expand_bits(cz + z) << 2)) &
+                        TABLE_MASK;
+
+                    sycl::uint2 bounds = d_cell_bounds[neighbor_hash];
+                    uint32_t start = bounds.x();
+                    uint32_t end = bounds.y();
+
+                    for (uint32_t j = start; j < end; ++j) {
+                      sycl::float4 n_pos = d_sorted_pos[j];
+                      float dx = my_pos.x() - n_pos.x();
+                      float dy = my_pos.y() - n_pos.y();
+                      float dz = my_pos.z() - n_pos.z();
+                      float dist2 =
+                          sycl::mad(dx, dx, sycl::mad(dy, dy, dz * dz));
+                      bool is_neigh = (dist2 <= radius2) && (idx != j);
+                      if (is_neigh) {
+                        d_neighbors[write_offset + local_neighbor_count] =
+                            sycl::bit_cast<int>(n_pos.w());
+                        local_neighbor_count++;
+                      }
+                    }
+                  }
+                }
               }
             }
           }
-        }
-      });
+        });
+  });
   evt.wait();
   start_ns =
       evt.get_profiling_info<sycl::info::event_profiling::command_start>();
